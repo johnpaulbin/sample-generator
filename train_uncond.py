@@ -21,8 +21,10 @@ import wandb
 from dataset.dataset import SampleDataset
 
 from audio_diffusion.models import DiffusionAttnUnet1D
-from audio_diffusion.utils import ema_update
+from audio_diffusion.utils import ema_update, InverseLR
 from viz.viz import audio_spectrogram_image
+from diffusion import sampling
+
 
 
 # Define the noise schedule and sampling loop
@@ -44,45 +46,10 @@ def alpha_sigma_to_t(alpha, sigma):
 @torch.no_grad()
 def sample(model, x, steps, eta):
     """Draws samples from a model given starting noise."""
-    ts = x.new_ones([x.shape[0]])
+    t = torch.linspace(1, 0, steps + 1, device="cuda:0")[:-1]
+    step_list = get_crash_schedule(t)
 
-    # Create the noise schedule
-    t = torch.linspace(1, 0, steps + 1)[:-1]
-
-    t = get_crash_schedule(t)
-
-    alphas, sigmas = get_alphas_sigmas(t)
-
-    # The sampling loop
-    for i in trange(steps):
-
-        # Get the model output (v, the predicted velocity)
-        with torch.cuda.amp.autocast():
-            v = model(x, ts * t[i]).float()
-
-        # Predict the noise and the denoised image
-        pred = x * alphas[i] - v * sigmas[i]
-        eps = x * sigmas[i] + v * alphas[i]
-
-        # If we are not on the last timestep, compute the noisy image for the
-        # next timestep.
-        if i < steps - 1:
-            # If eta > 0, adjust the scaling factor for the predicted noise
-            # downward according to the amount of additional noise to add
-            ddim_sigma = eta * (sigmas[i + 1]**2 / sigmas[i]**2).sqrt() * \
-                (1 - alphas[i]**2 / alphas[i + 1]**2).sqrt()
-            adjusted_sigma = (sigmas[i + 1]**2 - ddim_sigma**2).sqrt()
-
-            # Recombine the predicted noise and predicted denoised image in the
-            # correct proportions for the next step
-            x = pred * alphas[i + 1] + eps * adjusted_sigma
-
-            # Add the correct amount of fresh noise
-            if eta:
-                x += torch.randn_like(x) * ddim_sigma
-
-    # If we are on the last timestep, output the denoised image
-    return pred
+    return sampling.iplms_sample(model, x, step_list, {})
 
 
 
@@ -94,10 +61,11 @@ class DiffusionUncond(pl.LightningModule):
         self.diffusion_ema = deepcopy(self.diffusion)
         self.rng = torch.quasirandom.SobolEngine(1, scramble=True, seed=global_args.seed)
         self.ema_decay = global_args.ema_decay
-        
+
     def configure_optimizers(self):
-        return optim.Adam([*self.diffusion.parameters()], lr=4e-5)
-  
+        optimizer = optim.Adam(self.diffusion.parameters(), lr=4e-5)
+        return optimizer
+
     def training_step(self, batch, batch_idx):
         reals = batch[0]
 
@@ -178,6 +146,8 @@ class DemoCallback(pl.Callback):
                                                 caption=f'Demo')
         
             log_dict[f'demo_melspec_left'] = wandb.Image(audio_spectrogram_image(fakes))
+
+            log_dict[f'learning_rate'] = trainer.optimizers[0].param_groups[0]['lr']
 
             trainer.logger.experiment.log(log_dict, step=trainer.global_step)
         except Exception as e:
